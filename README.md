@@ -81,7 +81,49 @@ Each milestone has one accountable lead. Leads rotate so everyone gets hands-on 
 ## Status
 
 - [x] Project proposal submitted and approved
+- [ ] Course Milestone 1: first report (due 17 Nov 2026)
 - [ ] M1: breadboard pod and on-device pose pipeline
+- [ ] MVP for demo day (end of Semester A)
+
+## Repository layout
+
+```
+CoachPocket/
+├── firmware/   # ESP32-S3 pod: IMU sampling, timestamping, BLE packetization
+├── hardware/   # PCB schematics, layout, BOM, enclosure/strap
+├── app/        # Edge-device app: camera, pose, BLE receiver, fusion, voice cues
+├── ml/         # Data tooling, labelling, feature extraction, training, quantisation
+├── docs/       # Reports, diagrams, measurement logs
+└── README.md
+```
+
+Folders are added as each component lands. Every component folder gets its own README with exact toolchain versions and build steps.
+
+## Getting started
+
+### Prerequisites
+
+- Git and a GitHub account with access to this repo
+- Per component (versions are pinned in each folder's README):
+  - `firmware/`: ESP32-S3 toolchain and a USB cable to the dev board
+  - `app/`: Android development environment and an Android phone with developer mode enabled
+  - `ml/`: Python 3 with a virtual environment
+
+### Clone
+
+```bash
+git clone https://github.com/MorelAvraham/CoachPocket.git
+cd CoachPocket
+```
+
+Then follow the README inside the component you are working on.
+
+## Contributing
+
+- Each member commits their own work from their own GitHub account.
+- Work on a branch per task (`feature/ble-link`, `fix/clock-drift`) and merge to `main` through a pull request.
+- Commit messages describe the change, e.g. `firmware: add 1 kHz IMU sampling with local timestamps`.
+- Tasks, schedule and requirements are tracked in [Notion](https://app.notion.com/p/03f3bbd7caaa8320b7b60121d3fc1436).
 
 ## Hardware
 
