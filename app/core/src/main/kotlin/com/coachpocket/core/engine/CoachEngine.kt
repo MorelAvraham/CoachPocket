@@ -13,8 +13,13 @@ import com.coachpocket.core.squat.SquatConfig
 import com.coachpocket.core.squat.SquatFrameResult
 import com.coachpocket.core.squat.SquatPhase
 import com.coachpocket.core.squat.SquatVisionTracker
+import com.coachpocket.core.util.fmt
+
+/** Which sensor channels the engine uses. The single-channel modes exist for the ablation study (R5). */
+enum class ChannelMode { FUSED, VISION_ONLY, IMU_ONLY }
 
 data class EngineConfig(
+    val mode: ChannelMode = ChannelMode.FUSED,
     val squat: SquatConfig = SquatConfig(),
     val tempo: TempoConfig = TempoConfig(),
     val cue: CueConfig = CueConfig(),
@@ -67,6 +72,7 @@ class CoachEngine(
 
     @Synchronized
     fun onPoseFrame(frame: PoseFrame): List<CoachEvent> {
+        if (config.mode == ChannelMode.IMU_ONLY) return emptyList()
         val out = ArrayList<CoachEvent>(4)
         lastPoseUs = frame.tUs
         // Tempo comes from the pod when it is streaming, from the camera otherwise.
@@ -89,7 +95,7 @@ class CoachEngine(
 
     @Synchronized
     fun onImuSamples(samples: List<ImuSample>): List<CoachEvent> {
-        if (samples.isEmpty()) return emptyList()
+        if (samples.isEmpty() || config.mode == ChannelMode.VISION_ONLY) return emptyList()
         val out = ArrayList<CoachEvent>(2)
         for (s in samples) {
             tempoEvents.clear()
@@ -107,7 +113,7 @@ class CoachEngine(
                 FaultDetected(
                     FaultType.TOO_FAST_DESCENT, Channel.IMU, e.tOnsetUs, e.tConfirmUs,
                     severity = e.speed / config.tempo.maxDescentSpeed,
-                    detail = "descent speed %.2f m/s".format(e.speed),
+                    detail = fmt("descent speed %.2f m/s", e.speed),
                 ),
                 out,
             )
@@ -119,7 +125,7 @@ class CoachEngine(
                         FaultDetected(
                             FaultType.TOO_FAST_DESCENT, Channel.IMU, e.tEndUs, e.tEndUs,
                             severity = config.tempo.minEccentricUs.toFloat() / e.durationUs.coerceAtLeast(1),
-                            detail = "eccentric %.2f s, peak %.2f m/s".format(e.durationUs / 1e6, e.peakSpeed),
+                            detail = fmt("eccentric %.2f s, peak %.2f m/s", e.durationUs / 1e6, e.peakSpeed),
                         ),
                         out,
                     )

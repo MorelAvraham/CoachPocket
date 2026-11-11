@@ -50,6 +50,7 @@ class ClockSync(
     @Synchronized
     fun reset() {
         buckets.clear(); twoWay.clear()
+        transportBiasUs = 0 // measured on the previous link; meaningless for the next one
         lastPodUs = Long.MIN_VALUE
         fitted = false; slope = 0.0
     }

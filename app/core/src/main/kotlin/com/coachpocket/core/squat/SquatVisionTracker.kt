@@ -11,6 +11,7 @@ import com.coachpocket.core.util.OneEuroFilter
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sqrt
+import com.coachpocket.core.util.fmt
 
 enum class SquatPhase { NOT_TRACKED, CALIBRATING, TOP, DESCENT, ASCENT }
 
@@ -25,8 +26,11 @@ data class SquatConfig(
     val minVisibility: Float = 0.5f,
     val calibrationFrames: Int = 15,
     val descentStartH: Float = 0.93f,
-    /** The eccentric phase is timed from the last frame at or above this height. */
-    val standingH: Float = 0.985f,
+    /**
+     * The eccentric phase is timed from the last frame that was within this margin of the height
+     * the lifter held just before going down (not from the later [descentStartH] crossing).
+     */
+    val descentOnsetMargin: Float = 0.012f,
     val repDepthH: Float = 0.78f,
     val topReturnH: Float = 0.94f,
     val bottomReboundH: Float = 0.025f,
@@ -68,13 +72,22 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
     var visionTempoEnabled = true
 
     private val heightFilter = OneEuroFilter(minCutoffHz = 3.0, beta = 0.4, derivativeCutoffHz = 3.0)
+
+    // Smooths the raw leg length before it feeds the standing reference: a running maximum of a
+    // noisy signal creeps upward, which would make "standing" read as slightly squatted.
+    private val legFilter = OneEuroFilter(minCutoffHz = 1.0, beta = 0.0)
+
+    // Last ~2 s of (time, height) while standing, to find where a descent really began.
+    private val historyT = LongArray(HISTORY)
+    private val historyH = FloatArray(HISTORY)
+    private var historyCount = 0
+    private var historyNext = 0
     private var standingLegLen = 0f
     private var calibrationCount = 0
     private var lastValidUs = Long.MIN_VALUE
     private var lastFrameUs = Long.MIN_VALUE
 
     private var descentStartUs = 0L
-    private var lastStandingUs = Long.MIN_VALUE
     private var minH = 1f
     private var minHUs = 0L
     private var bottomUs = 0L
@@ -92,7 +105,8 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
     }
 
     private fun recalibrate() {
-        heightFilter.reset()
+        heightFilter.reset(); legFilter.reset()
+        historyCount = 0; historyNext = 0
         standingLegLen = 0f; calibrationCount = 0
         valgusFrames = 0; valgusActive = false; valgusReportedThisRep = false
         if (phase != SquatPhase.NOT_TRACKED) phase = SquatPhase.CALIBRATING
@@ -123,9 +137,13 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
 
         // Standing reference: the tallest the legs have looked, decaying slowly so that the
         // reference follows the lifter stepping back from the camera.
-        standingLegLen = max(legLen, standingLegLen * (1f - 0.005f * dt))
+        val smoothLeg = legFilter.filter(legLen.toDouble(), t / 1e6).toFloat()
+        standingLegLen = max(smoothLeg, standingLegLen * (1f - 0.005f * dt))
         val h = heightFilter.filter((legLen / standingLegLen).toDouble(), t / 1e6).toFloat()
         val rising = heightFilter.derivative > 0
+        historyT[historyNext] = t; historyH[historyNext] = h
+        historyNext = (historyNext + 1) % HISTORY
+        if (historyCount < HISTORY) historyCount++
 
         val hipWidth = abs(lHip.x - rHip.x) * frame.aspect
         val frontal = hipWidth / standingLegLen >= config.frontalMinHipWidthRatio
@@ -143,11 +161,10 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
             }
 
             SquatPhase.TOP -> {
-                if (h >= config.standingH) lastStandingUs = t
                 if (h < config.descentStartH) {
                     phase = SquatPhase.DESCENT
                     // Crossing the threshold happens well into the movement; time it from the top.
-                    descentStartUs = if (lastStandingUs != Long.MIN_VALUE && t - lastStandingUs < 1_500_000) lastStandingUs else t
+                    descentStartUs = descentOnset(t)
                     minH = h; minHUs = t
                     valgusFrames = 0; valgusActive = false; valgusReportedThisRep = false
                     events += CoachEvent.RepStarted(t)
@@ -170,7 +187,7 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
                             events += CoachEvent.FaultDetected(
                                 FaultType.TOO_FAST_DESCENT, Channel.VISION, bottomUs, t,
                                 severity = config.minEccentricUs.toFloat() / max(eccentricUs, 1L),
-                                detail = "eccentric %.2f s (vision)".format(eccentricUs / 1e6),
+                                detail = fmt("eccentric %.2f s (vision)", eccentricUs / 1e6),
                             )
                         }
                     }
@@ -216,7 +233,7 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
                     val side = if (left > on && right > on) "both knees" else if (left > right) "left knee" else "right knee"
                     events += CoachEvent.FaultDetected(
                         FaultType.KNEE_VALGUS, Channel.VISION, valgusOnsetUs, t,
-                        severity = dev / on, detail = "$side, deviation %.3f".format(dev),
+                        severity = dev / on, detail = fmt("$side, deviation %.3f", dev),
                     )
                 }
             }
@@ -225,6 +242,27 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
         } else if (!valgusActive) {
             valgusFrames = 0 // inside the hysteresis band without having confirmed: start over
         }
+    }
+
+    /**
+     * Walks back from the newest frame to the last one that was still at the height held before
+     * the descent. "The height held" is the median of the recent past, so neither a biased standing
+     * reference nor a single jittery frame shifts the answer.
+     */
+    private fun descentOnset(nowUs: Long): Long {
+        val recent = FloatArray(historyCount)
+        var n = 0
+        for (k in 1..historyCount) {
+            val i = (historyNext - k + HISTORY) % HISTORY
+            if (nowUs - historyT[i] > ONSET_LOOKBACK_US) break
+            recent[n++] = historyH[i]
+        }
+        if (n < 3) return nowUs
+        val level = recent.copyOf(n).also { it.sort() }[n / 2] - config.descentOnsetMargin
+        for (k in 0 until n) {
+            if (recent[k] >= level) return historyT[(historyNext - 1 - k + HISTORY) % HISTORY]
+        }
+        return nowUs
     }
 
     private fun legsVisible(lm: List<Landmark>): Boolean {
@@ -262,6 +300,8 @@ class SquatVisionTracker(private val config: SquatConfig = SquatConfig()) {
     }
 
     private companion object {
+        const val HISTORY = 64
+        const val ONSET_LOOKBACK_US = 1_500_000L
         val LEG_POINTS = intArrayOf(
             PoseIndex.L_HIP, PoseIndex.R_HIP, PoseIndex.L_KNEE, PoseIndex.R_KNEE, PoseIndex.L_ANKLE, PoseIndex.R_ANKLE,
         )

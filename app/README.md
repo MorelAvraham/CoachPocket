@@ -22,10 +22,13 @@ All library versions live in `gradle/libs.versions.toml`.
 
 ```bash
 cd app
-./gradlew :core:test            # logic tests, no Android SDK or phone needed
-./gradlew :mobile:assembleDebug # APK in mobile/build/outputs/apk/debug/
-./gradlew :mobile:installDebug  # onto a phone with USB debugging enabled
+./gradlew :core:test :tools:test # logic tests, no Android SDK or phone needed
+./gradlew :mobile:assembleDebug  # APK in mobile/build/outputs/apk/debug/
+./gradlew :mobile:installDebug   # onto a phone with USB debugging enabled
 ```
+
+Every pull request that touches `app/` runs the tests, Android lint and the APK build in GitHub
+Actions (`.github/workflows/app.yml`); the APK is attached to the run as an artifact.
 
 Or open the `app/` folder in Android Studio. The first build downloads the two pose models
 (lite 5.5 MB, full 9 MB) into `mobile/src/main/assets/`; they are not committed.
@@ -42,18 +45,21 @@ app/
 │   ├── imu/       vertical-velocity tracking and descent tempo from the pod
 │   ├── cue/       cue arbitration: cooldown, priority, one at a time (R7)
 │   ├── engine/    CoachEngine: glues the channels together, emits events
-│   └── sim/       SimulatedPod: generates the firmware's exact packets
+│   ├── session/   recorded-session file format, reader and writer
+│   ├── eval/      replay, per-fault scoring, ablation, link (U1) and tap-sync (U2) analysis
+│   └── sim/       SimulatedPod and synthetic sessions: the firmware's exact packets, no hardware
+├── tools/    Command-line front end to core/eval. Runs on a laptop.
 └── mobile/   Android app: thin shell around core.
     ├── camera/    CameraX + MediaPipe Pose Landmarker (GPU, CPU fallback)
-    ├── ble/       GATT client for the pod
+    ├── ble/       GATT client for the pod, and a pod emulator for a second phone
     ├── audio/     pre-synthesised cue clips on a SoundPool
-    ├── record/    session recorder (keypoints + IMU + events as CSV)
-    └── ui/        one Compose screen: preview, skeleton, live metrics
+    ├── record/    session recorder (keypoints + IMU + events, never video)
+    └── ui/        coach screen, record and threshold dialogs, pod-emulator screen
 ```
 
 The split matters: `core` has no Android dependency, so a recorded session can be replayed through
 exactly the code that runs on the phone, from a laptop. That is how the camera-only vs pod-only vs
-fused comparison (R5) will be run.
+fused comparison (R5) is run: see [docs/data-collection.md](../docs/data-collection.md).
 
 ## Using it
 
@@ -62,10 +68,17 @@ fused comparison (R5) will be run.
 2. Stand tall for a moment (calibrates standing hip height), then lift.
 3. `Connect pod` scans for the CoachPocket BLE service. Without a pod the app runs camera-only and
    measures descent tempo from the camera instead.
-4. `Record` writes `imu.csv`, `pose.csv` and `events.csv` under
-   `Android/data/com.coachpocket.app/files/sessions/<timestamp>/`. Keypoints only, never video.
-5. `Sim pod` feeds synthetic pod packets (two controlled squats, then one dive-bomb, repeating) to
-   bench-test the receive path. It is not linked to what the camera sees.
+4. `Record` asks who is lifting and what they will do on purpose (clean, or a deliberate fault),
+   then saves the set under `Android/data/com.coachpocket.app/files/sessions/`. That answer is the
+   set's ground-truth label. Keypoints and pod data only, never video.
+5. `Tune` changes the thresholds and switches channels (fused / camera only / pod only) without
+   rebuilding. Values persist on the phone and are written into every recording.
+6. `Be the pod` turns a **second phone** into a stand-in pod: it streams its own IMU over BLE in the
+   pod packet format, with the time beacon. Strap it to the wrist and the BLE link, clock sync and
+   fusion can be exercised today, before the breadboard pod exists. It is a development aid, not a
+   substitute: phone IMUs give 200 to 500 Hz, not 1 kHz.
+7. `Sim pod` feeds synthetic pod packets (two controlled squats, then one dive-bomb, repeating) to
+   bench-test the receive path on one phone. It is not linked to what the camera sees.
 
 The top panel is the measurement harness: pose fps and inference time (R3), pod sample rate and
 packet loss (R1), sync state, and cue latency from fault onset to the audio play call.
@@ -84,9 +97,14 @@ happen outside a rep (walking the bar out, re-racking).
 
 ## Known limits: read before trusting a number
 
-- **Not yet run on a phone.** The logic is covered by 26 JVM tests and the APK builds and passes
-  lint, but camera, GPU inference, BLE and audio have not been exercised on hardware. Expect
-  first-run fixes.
+- **Not yet run on a phone.** The logic is covered by JVM tests and the APK builds and passes
+  lint, but camera, GPU inference, BLE (both roles) and audio have not been exercised on hardware.
+  Expect first-run fixes.
+- **Squat only.** Deadlift and overhead press are not started, on purpose: their faults have not
+  been defined with the trainer, and detectors written before that would be guesses.
+- **Lumbar rounding cannot be measured with this pose model.** BlazePose gives shoulders and hips
+  and nothing along the spine, so a rounded back and a flat back hinged at the hip look the same.
+  The README lists it as a camera fault; it needs either a different model or a different fault.
 - **Every threshold is a placeholder** (`SquatConfig`, `TempoConfig`). They are reasoned defaults,
   not fitted values. They get fitted on the labelled data (U4, M2/M3) and reviewed with the trainer.
 - **The latency shown is a lower bound.** It ends at the `play()` call. Speaker output adds tens of

@@ -3,6 +3,7 @@ package com.coachpocket.core.cue
 import com.coachpocket.core.engine.CoachEvent.FaultDetected
 import com.coachpocket.core.engine.Cue
 import com.coachpocket.core.engine.FaultType
+import com.coachpocket.core.util.fmt
 
 data class CueConfig(
     /** Minimum silence between any two cues. A higher-priority fault may cut in. */
@@ -39,7 +40,7 @@ class CueManager(private val config: CueConfig = CueConfig()) {
         val previous = lastSpoken[type.ordinal]
         if (previous != Long.MIN_VALUE && nowUs - previous < config.perFaultCooldownUs) {
             suppressed++
-            return CueDecision.Suppress("same cue given %.1f s ago".format((nowUs - previous) / 1e6))
+            return CueDecision.Suppress(fmt("same cue given %.1f s ago", (nowUs - previous) / 1e6))
         }
         var interrupt = false
         if (lastCueUs != Long.MIN_VALUE && nowUs - lastCueUs < config.globalGapUs) {

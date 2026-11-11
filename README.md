@@ -97,7 +97,11 @@ CoachPocket/
 └── README.md
 ```
 
-`app/` is in: see [app/README.md](app/README.md) for the build steps, and [docs/pod-ble-protocol.md](docs/pod-ble-protocol.md) for the pod-to-phone packet format (draft, awaiting firmware review).
+`app/` is in:
+
+- [app/README.md](app/README.md): build steps, modules, how detection works today, known limits
+- [docs/pod-ble-protocol.md](docs/pod-ble-protocol.md): pod-to-phone packet format (draft, awaiting firmware review)
+- [docs/data-collection.md](docs/data-collection.md): recording labelled sets and producing the precision/recall and ablation tables
 
 The remaining folders are added as each component lands. Every component folder gets its own README with exact toolchain versions and build steps.
 

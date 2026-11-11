@@ -14,4 +14,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "CoachPocket"
-include(":core", ":mobile")
+include(":core", ":tools", ":mobile")

@@ -3,6 +3,7 @@ package com.coachpocket.core
 import com.coachpocket.core.engine.CoachEvent
 import com.coachpocket.core.engine.FaultType
 import com.coachpocket.core.sim.SquatMotion
+import com.coachpocket.core.sim.SyntheticLifter
 import com.coachpocket.core.squat.SquatPhase
 import com.coachpocket.core.squat.SquatVisionTracker
 import kotlin.math.abs
@@ -28,8 +29,8 @@ class SquatVisionTest {
             val s = t / 1e6
             val rep = if (s < lead) -1 else ((s - lead) / motion.totalS).toInt()
             val tInRep = if (rep < 0) -1.0 else (s - lead) - rep * motion.totalS
-            val h = if (rep < 0) 1f else Synthetic.height(motion, tInRep)
-            events += tracker.process(Synthetic.frame(t, h, if (rep < 0) 0f else valgus(rep, tInRep), frontal)).events
+            val h = if (rep < 0) 1f else SyntheticLifter.height(motion, tInRep)
+            events += tracker.process(SyntheticLifter.frame(t, h, if (rep < 0) 0f else valgus(rep, tInRep), frontal)).events
             t += frameUs
         }
         return tracker to events
@@ -53,9 +54,9 @@ class SquatVisionTest {
     fun shallowDipIsNotARep() {
         val tracker = SquatVisionTracker()
         var t = 0L
-        repeat(45) { tracker.process(Synthetic.frame(t, 1f)); t += frameUs }
+        repeat(45) { tracker.process(SyntheticLifter.frame(t, 1f)); t += frameUs }
         for (h in listOf(0.95f, 0.9f, 0.86f, 0.86f, 0.9f, 0.95f, 1f, 1f, 1f, 1f, 1f, 1f)) {
-            repeat(4) { tracker.process(Synthetic.frame(t, h)); t += frameUs }
+            repeat(4) { tracker.process(SyntheticLifter.frame(t, h)); t += frameUs }
         }
         assertEquals(0, tracker.repCount)
         assertEquals(SquatPhase.TOP, tracker.phase)
@@ -102,9 +103,9 @@ class SquatVisionTest {
     fun losingTheLifterResetsTracking() {
         val tracker = SquatVisionTracker()
         var t = 0L
-        repeat(40) { tracker.process(Synthetic.frame(t, 1f)); t += frameUs }
+        repeat(40) { tracker.process(SyntheticLifter.frame(t, 1f)); t += frameUs }
         assertEquals(SquatPhase.TOP, tracker.phase)
-        repeat(40) { tracker.process(Synthetic.frame(t, 1f, visible = false)); t += frameUs }
+        repeat(40) { tracker.process(SyntheticLifter.frame(t, 1f, visible = false)); t += frameUs }
         assertEquals(SquatPhase.NOT_TRACKED, tracker.phase)
     }
 }

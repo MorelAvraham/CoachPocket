@@ -50,6 +50,11 @@ class PodBleClient(private val context: Context, private val listener: Listener)
     private var gatt: BluetoothGatt? = null
     private var syncCharacteristic: BluetoothGattCharacteristic? = null
     private var scanning = false
+    private var negotiatedMtu = 23
+
+    @Volatile
+    private var lastPacketNs = 0L
+    private var silenceReported = false
 
     fun connect() {
         val scanner = adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner
@@ -71,12 +76,14 @@ class PodBleClient(private val context: Context, private val listener: Listener)
     fun disconnect() {
         stopScan()
         handler.removeCallbacks(syncPing)
+        handler.removeCallbacks(watchdog)
         gatt?.let {
             it.disconnect()
             it.close()
         }
         gatt = null
         syncCharacteristic = null
+        negotiatedMtu = 23
         listener.onPodState(PodState.IDLE, null)
     }
 
@@ -120,6 +127,7 @@ class PodBleClient(private val context: Context, private val listener: Listener)
             } else {
                 handler.post {
                     handler.removeCallbacks(syncPing)
+                    handler.removeCallbacks(watchdog)
                     if (gatt === g) {
                         g.close()
                         gatt = null
@@ -131,6 +139,7 @@ class PodBleClient(private val context: Context, private val listener: Listener)
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) negotiatedMtu = mtu
             g.discoverServices()
         }
 
@@ -157,7 +166,11 @@ class PodBleClient(private val context: Context, private val listener: Listener)
                 syncCharacteristic = descriptor.characteristic
                 handler.post(syncPing)
             }
-            listener.onPodState(PodState.STREAMING, if (sync == null) "no time beacon" else null)
+            lastPacketNs = SystemClock.elapsedRealtimeNanos()
+            silenceReported = false
+            handler.removeCallbacks(watchdog)
+            handler.postDelayed(watchdog, WATCHDOG_MS)
+            listener.onPodState(PodState.STREAMING, linkNote(sync != null))
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
@@ -172,9 +185,40 @@ class PodBleClient(private val context: Context, private val listener: Listener)
         }
     }
 
+    /** What is worth telling the operator about the link, or null when everything is as designed. */
+    private fun linkNote(hasBeacon: Boolean): String? {
+        val notes = ArrayList<String>(2)
+        if (negotiatedMtu < PodProtocol.REQUESTED_MTU) {
+            // Full 19-sample packets need 241 bytes of MTU; below that the pod must send shorter ones.
+            val fit = ((negotiatedMtu - 3 - PodProtocol.HEADER_BYTES) / PodProtocol.SAMPLE_BYTES).coerceAtLeast(0)
+            notes += "MTU $negotiatedMtu: at most $fit samples per packet"
+        }
+        if (!hasBeacon) notes += "no time beacon"
+        return notes.joinToString(", ").ifEmpty { null }
+    }
+
+    /** A link can stay "connected" while the pod has hung or walked out of range: say so. */
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (gatt == null) return
+            val silentMs = (SystemClock.elapsedRealtimeNanos() - lastPacketNs) / 1_000_000
+            if (silentMs > SILENCE_MS) {
+                silenceReported = true
+                listener.onPodState(PodState.STREAMING, "no data for ${silentMs / 1000} s")
+            } else if (silenceReported) {
+                silenceReported = false
+                listener.onPodState(PodState.STREAMING, linkNote(syncCharacteristic != null))
+            }
+            handler.postDelayed(this, WATCHDOG_MS)
+        }
+    }
+
     private fun dispatch(uuid: UUID, value: ByteArray, rxNs: Long) {
         when (uuid) {
-            IMU_DATA -> listener.onImuPacket(value, rxNs)
+            IMU_DATA -> {
+                lastPacketNs = rxNs
+                listener.onImuPacket(value, rxNs)
+            }
             SYNC -> listener.onSyncResponse(value, rxNs)
         }
     }
@@ -229,5 +273,7 @@ class PodBleClient(private val context: Context, private val listener: Listener)
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         const val SCAN_TIMEOUT_MS = 15_000L
         const val SYNC_INTERVAL_MS = 1_000L
+        const val WATCHDOG_MS = 1_000L
+        const val SILENCE_MS = 3_000L
     }
 }

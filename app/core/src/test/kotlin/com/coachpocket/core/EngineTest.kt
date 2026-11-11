@@ -11,6 +11,7 @@ import com.coachpocket.core.imu.TempoEvent
 import com.coachpocket.core.protocol.PodStreamDecoder
 import com.coachpocket.core.sim.SimulatedPod
 import com.coachpocket.core.sim.SquatMotion
+import com.coachpocket.core.sim.SyntheticLifter
 import com.coachpocket.core.sync.ClockSync
 import kotlin.math.abs
 import kotlin.test.Test
@@ -60,8 +61,8 @@ class EngineTest {
                 packet = pod.nextPacket()
             } else {
                 val tS = nextFrameCaptureUs / 1e6
-                val h = if (lifterStandsStill) 1f else Synthetic.heightAt(motions, leadIn, tS)
-                events += engine.onPoseFrame(Synthetic.frame(nextFrameCaptureUs, h, valgus(tS)))
+                val h = if (lifterStandsStill) 1f else SyntheticLifter.heightAt(motions, leadIn, tS)
+                events += engine.onPoseFrame(SyntheticLifter.frame(nextFrameCaptureUs, h, valgus(tS)))
                 nextFrameCaptureUs += 33_333
             }
         }
