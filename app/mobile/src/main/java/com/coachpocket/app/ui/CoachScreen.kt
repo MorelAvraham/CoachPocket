@@ -49,6 +49,7 @@ import com.coachpocket.app.nowUs
 import com.coachpocket.core.pose.PoseFrame
 import com.coachpocket.core.pose.PoseIndex
 import com.coachpocket.core.squat.SquatPhase
+import com.coachpocket.core.util.fmt
 import kotlinx.coroutines.delay
 
 private val Good = Color(0xFF4ADE80)
@@ -57,11 +58,13 @@ private val Bad = Color(0xFFF87171)
 private val Panel = Color(0xB3000000)
 
 @Composable
-fun CoachScreen(viewModel: CoachViewModel = viewModel()) {
+fun CoachScreen(onOpenEmulator: () -> Unit, viewModel: CoachViewModel = viewModel()) {
     val context = LocalContext.current
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     val pose by viewModel.pose.collectAsStateWithLifecycle()
     var frontCamera by rememberSaveable { mutableStateOf(false) }
+    var showRecordDialog by remember { mutableStateOf(false) }
+    var showTuningDialog by remember { mutableStateOf(false) }
     var cameraGranted by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
@@ -106,7 +109,12 @@ fun CoachScreen(viewModel: CoachViewModel = viewModel()) {
                         }
                     },
                     onSim = viewModel::toggleSimulation,
-                    onRecord = viewModel::toggleRecording,
+                    onRecord = { if (ui.recordingPath != null) viewModel.stopRecording() else showRecordDialog = true },
+                    onTune = { showTuningDialog = true },
+                    onEmulator = {
+                        viewModel.disconnectPod()
+                        onOpenEmulator()
+                    },
                     onFlip = { frontCamera = !frontCamera },
                     onModel = viewModel::toggleModel,
                     onReset = viewModel::resetSession,
@@ -114,13 +122,34 @@ fun CoachScreen(viewModel: CoachViewModel = viewModel()) {
             }
         }
     }
+
+    if (showRecordDialog) {
+        RecordDialog(
+            initialSubject = ui.lastSubject,
+            onStart = { subject, condition, reps ->
+                showRecordDialog = false
+                viewModel.startRecording(subject, condition, reps)
+            },
+            onDismiss = { showRecordDialog = false },
+        )
+    }
+    if (showTuningDialog) {
+        TuningDialog(
+            current = ui.tuning,
+            onApply = {
+                showTuningDialog = false
+                viewModel.setTuning(it)
+            },
+            onDismiss = { showTuningDialog = false },
+        )
+    }
 }
 
 @Composable
 private fun Hud(ui: UiState) {
     Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(8.dp)).padding(8.dp)) {
         val fpsColor = if (ui.fps >= 28f) Good else if (ui.fps >= 20f) Warn else Bad
-        Mono("POSE  %.0f fps  %.0f ms  %s/%s".format(ui.fps, ui.inferenceMs, ui.model.label, ui.delegate), fpsColor)
+        Mono(fmt("POSE  %.0f fps  %.0f ms  %s/%s", ui.fps, ui.inferenceMs, ui.model.label, ui.delegate), fpsColor)
         ui.poseError?.let { Mono("      $it", Bad) }
         if (!ui.cameraClockSynced) Mono("      camera clock is not the boot clock: sync degraded", Warn)
         if (ui.phase != SquatPhase.NOT_TRACKED && !ui.frontalView) Mono("      side view: knee valgus needs the camera in front", Warn)
@@ -133,30 +162,33 @@ private fun Hud(ui: UiState) {
         Mono("POD   ${ui.podState}${ui.podMessage?.let { " ($it)" } ?: ""}", podColor)
         if (ui.podState == PodState.STREAMING || ui.podState == PodState.SIMULATED) {
             Mono(
-                "      %.0f Hz  loss %.2f%% (%d/%d pkts)".format(
+                fmt("      %.0f Hz  loss %.2f%% (%d/%d pkts)", 
                     ui.sampleRateHz, ui.lossPercent, ui.packetsLost, ui.packetsReceived + ui.packetsLost,
                 ),
                 if (ui.lossPercent < 1f) Good else Warn,
             )
             Mono(
-                "SYNC  %s  skew %+.0f ppm  bias %.1f ms".format(if (ui.syncLocked) "locked" else "acquiring", ui.skewPpm, ui.transportBiasMs),
+                fmt("SYNC  %s  skew %+.0f ppm  bias %.1f ms", if (ui.syncLocked) "locked" else "acquiring", ui.skewPpm, ui.transportBiasMs),
                 if (ui.syncLocked) Good else Warn,
             )
-            Mono("      v %+.2f m/s  last descent %s".format(ui.imuVelocity, ui.lastDescent.ifEmpty { "-" }), Color.LightGray)
+            Mono(fmt("      v %+.2f m/s  last descent %s", ui.imuVelocity, ui.lastDescent.ifEmpty { "-" }), Color.LightGray)
         }
         val p95 = ui.latencyP95Ms
         Mono(
-            "CUES  %d spoken, %d held back  onset-to-play p50 %s p95 %s".format(
+            fmt("CUES  %d spoken, %d held back  onset-to-play p50 %s p95 %s", 
                 ui.cuesSpoken, ui.cuesSuppressed, ms(ui.latencyP50Ms), ms(p95),
             ),
             if (p95.isNaN()) Color.LightGray else if (p95 <= 300f) Good else if (p95 <= 500f) Warn else Bad,
         )
         if (!ui.cueClipsReady) Mono("      preparing voice clips (live TTS until ready, slower)", Warn)
-        ui.recordingPath?.let { Mono("REC   $it", Bad) }
+        if (ui.tuning.mode != com.coachpocket.core.engine.ChannelMode.FUSED) {
+            Mono("MODE  ${ui.tuning.mode.name.lowercase()} (ablation: one channel is switched off)", Warn)
+        }
+        ui.recordingPath?.let { Mono("REC   ${it.substringAfterLast('/')}", Bad) }
     }
 }
 
-private fun ms(v: Float) = if (v.isNaN()) "-" else "%.0f ms".format(v)
+private fun ms(v: Float) = if (v.isNaN()) "-" else fmt("%.0f ms", v)
 
 @Composable
 private fun Mono(text: String, color: Color) {
@@ -197,10 +229,10 @@ private fun RepPanel(ui: UiState) {
             Text("SQUAT  $phase", color = if (ui.phase == SquatPhase.NOT_TRACKED) Warn else Good, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             if (!ui.hipHeight.isNaN()) {
                 Mono(
-                    "hip %.2f  knee %s  valgus %s".format(
+                    fmt("hip %.2f  knee %s  valgus %s", 
                         ui.hipHeight,
-                        if (ui.kneeAngle.isNaN()) "-" else "%.0f deg".format(ui.kneeAngle),
-                        if (ui.valgus.isNaN()) "n/a" else "%+.3f".format(ui.valgus),
+                        if (ui.kneeAngle.isNaN()) "-" else fmt("%.0f deg", ui.kneeAngle),
+                        if (ui.valgus.isNaN()) "n/a" else fmt("%+.3f", ui.valgus),
                     ),
                     Color.LightGray,
                 )
@@ -216,6 +248,8 @@ private fun Controls(
     onPod: () -> Unit,
     onSim: () -> Unit,
     onRecord: () -> Unit,
+    onTune: () -> Unit,
+    onEmulator: () -> Unit,
     onFlip: () -> Unit,
     onModel: () -> Unit,
     onReset: () -> Unit,
@@ -233,9 +267,11 @@ private fun Controls(
             colors = if (ui.recordingPath != null) ButtonDefaults.buttonColors(containerColor = Bad) else ButtonDefaults.buttonColors(),
         ) { Text(if (ui.recordingPath != null) "Stop rec" else "Record") }
         FilledTonalButton(onClick = onReset) { Text("Reset") }
+        FilledTonalButton(onClick = onTune) { Text("Tune") }
         FilledTonalButton(onClick = onFlip) { Text("Flip") }
         FilledTonalButton(onClick = onModel) { Text("Model: ${ui.model.label}") }
         FilledTonalButton(onClick = onSim) { Text(if (ui.podState == PodState.SIMULATED) "Stop sim" else "Sim pod") }
+        FilledTonalButton(onClick = onEmulator) { Text("Be the pod") }
     }
 }
 
@@ -261,7 +297,7 @@ private fun PoseOverlay(frame: PoseFrame?, ui: UiState, mirror: Boolean, modifie
             return Offset(left + x * w, top + lm[i].y * h)
         }
 
-        val valgus = !ui.valgus.isNaN() && ui.valgus > 0.08f &&
+        val valgus = !ui.valgus.isNaN() && ui.valgus > ui.tuning.valgusThreshold &&
             (ui.phase == SquatPhase.DESCENT || ui.phase == SquatPhase.ASCENT)
         for ((a, b) in PoseIndex.SKELETON) {
             if (lm[a].visibility < 0.5f || lm[b].visibility < 0.5f) continue

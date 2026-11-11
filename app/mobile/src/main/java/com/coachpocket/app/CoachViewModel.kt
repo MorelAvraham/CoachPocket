@@ -1,6 +1,7 @@
 package com.coachpocket.app
 
 import android.app.Application
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.coachpocket.app.audio.CuePlayer
@@ -11,14 +12,18 @@ import com.coachpocket.app.camera.PoseModel
 import com.coachpocket.app.record.SessionRecorder
 import com.coachpocket.core.engine.CoachEngine
 import com.coachpocket.core.engine.CoachEvent
+import com.coachpocket.core.engine.FaultType
 import com.coachpocket.core.pose.PoseFrame
 import com.coachpocket.core.protocol.PodPacketCodec
+import com.coachpocket.core.session.SessionMeta
 import com.coachpocket.core.protocol.PodStreamDecoder
 import com.coachpocket.core.sim.SimulatedPod
 import com.coachpocket.core.sim.SquatMotion
 import com.coachpocket.core.squat.SquatPhase
 import com.coachpocket.core.sync.ClockSync
 import com.coachpocket.core.util.RollingStats
+import com.coachpocket.core.util.fmt
+import java.time.Instant
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -66,11 +71,17 @@ data class UiState(
     val latencyP95Ms: Float = Float.NaN,
     val cueClipsReady: Boolean = false,
     val recordingPath: String? = null,
+    val tuning: Tuning = Tuning(),
+    val lastSubject: String = "",
     val log: List<String> = emptyList(),
 )
 
 class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Listener {
-    private val engine = CoachEngine(nowUs = ::nowUs)
+    private val tuningStore = TuningStore(app)
+
+    // Replaced as a whole when the thresholds change; each callback reads the reference once.
+    @Volatile
+    private var engine = CoachEngine(tuningStore.load().toEngineConfig(), ::nowUs)
     private val decoder = PodStreamDecoder()
     private val sync = ClockSync()
     private val podLock = Any()
@@ -82,7 +93,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
     val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     val poseEstimator = PoseEstimator(app, ::onPose, ::onPoseStatus)
 
-    private val _ui = MutableStateFlow(UiState())
+    private val _ui = MutableStateFlow(UiState(tuning = tuningStore.load(), lastSubject = tuningStore.lastSubject))
     val ui: StateFlow<UiState> = _ui
 
     private val _pose = MutableStateFlow<PoseFrame?>(null)
@@ -108,7 +119,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
         inferenceMs = if (inferenceMs == 0f) inferMs else inferenceMs + 0.1f * (inferMs - inferenceMs)
 
         val events = engine.onPoseFrame(frame)
-        recorder.pose(frame)
+        recorder.pose(frame, nowUs())
         _pose.value = frame
         handle(events)
         pushUi(force = events.isNotEmpty())
@@ -155,7 +166,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
             val packet = decoder.decode(bytes) ?: return
             sync.addOneWay(packet.lastSamplePodUs, rxUs)
             val onPhoneClock = packet.samples.map { it.copy(tUs = sync.podToPhoneUs(it.tUs)) }
-            recorder.imu(packet.samples, onPhoneClock)
+            recorder.imu(packet.samples, onPhoneClock, rxUs)
             events = engine.onImuSamples(onPhoneClock)
 
             if (rateWindowStartUs == 0L) rateWindowStartUs = rxUs
@@ -221,14 +232,51 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
 
     // ---- Session ------------------------------------------------------------------------
 
-    fun toggleRecording() {
-        if (recorder.isRecording) {
-            recorder.stop()
-            _ui.update { it.copy(recordingPath = null) }
-        } else {
-            val dir = recorder.start()
-            _ui.update { it.copy(recordingPath = dir?.path, log = (it.log + "Recording to ${dir?.name}").takeLast(LOG_LINES)) }
+    /**
+     * Starts recording a set. [condition] is what the lifter is about to do on purpose (empty =
+     * clean technique); it becomes the ground truth for every repetition of the set unless a
+     * `labels.csv` is added later. [expectedReps] is how many repetitions they intend to perform.
+     */
+    fun startRecording(subject: String, condition: Set<FaultType>, expectedReps: Int?) {
+        if (recorder.isRecording) return
+        tuningStore.lastSubject = subject
+        val state = _ui.value
+        val app = getApplication<Application>()
+        val extra = LinkedHashMap<String, String>()
+        extra["view"] = when {
+            state.phase == SquatPhase.NOT_TRACKED -> "unknown"
+            state.frontalView -> "front"
+            else -> "side"
         }
+        extra["started_utc"] = Instant.now().toString()
+        extra["device"] = "${Build.MANUFACTURER} ${Build.MODEL}"
+        extra["android_sdk"] = Build.VERSION.SDK_INT.toString()
+        extra["app_version"] = app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: "?"
+        extra["pose_model"] = state.model.label
+        extra["pose_delegate"] = state.delegate
+        extra["camera_clock_synced"] = state.cameraClockSynced.toString()
+        extra["pod"] = state.podState.name.lowercase()
+        extra.putAll(state.tuning.toMeta())
+        val dir = recorder.start(SessionMeta.of(subject.trim(), condition, expectedReps, extra = extra))
+        engine.reset() // repetition numbers in the file start at 1
+        _ui.update {
+            it.copy(
+                recordingPath = dir?.path, lastSubject = subject, reps = 0,
+                log = (it.log + if (dir == null) "Could not create the session folder" else "Recording ${dir.name}").takeLast(LOG_LINES),
+            )
+        }
+    }
+
+    fun stopRecording() {
+        recorder.stop()
+        _ui.update { it.copy(recordingPath = null) }
+    }
+
+    fun setTuning(tuning: Tuning) {
+        tuningStore.save(tuning)
+        engine = CoachEngine(tuning.toEngineConfig(), ::nowUs)
+        latency.clear()
+        _ui.update { it.copy(tuning = tuning, reps = 0) }
     }
 
     fun resetSession() {
@@ -244,13 +292,13 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
                     val playedUs = cuePlayer.play(e.cue)
                     val ms = (playedUs - e.fault.tOnsetUs) / 1000f
                     latency.add(ms.toDouble())
-                    val line = "CUE \"${e.cue.text}\" %.0f ms after onset [${e.fault.channel}] ${e.fault.detail}".format(ms)
+                    val line = fmt("CUE \"${e.cue.text}\" %.0f ms after onset [${e.fault.channel}] ${e.fault.detail}", ms)
                     recorder.event(playedUs, "cue", line)
                     _ui.update { it.copy(lastCue = e.cue.text, lastCueAtUs = playedUs, log = (it.log + line).takeLast(LOG_LINES)) }
                 }
 
                 is CoachEvent.RepCompleted -> {
-                    val line = "Rep ${e.index}: down %.1f s, up %.1f s, depth %.2f".format(e.eccentricUs / 1e6, e.concentricUs / 1e6, e.depth)
+                    val line = fmt("Rep ${e.index}: down %.1f s, up %.1f s, depth %.2f", e.eccentricUs / 1e6, e.concentricUs / 1e6, e.depth)
                     recorder.event(e.tUs, "rep", line)
                     _ui.update { it.copy(lastRep = line, log = (it.log + line).takeLast(LOG_LINES)) }
                 }
@@ -285,7 +333,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
                 lossPercent = (decoder.lossRatio * 100).toFloat(),
                 syncLocked = sync.isLocked, skewPpm = sync.skewPpm.toFloat(), transportBiasMs = sync.transportBiasUs / 1000f,
                 imuVelocity = engine.imuVelocity,
-                lastDescent = if (d == null) "" else "%.2f s, peak %.2f m/s, %.2f m".format(d.durationUs / 1e6, d.peakSpeed, d.travelM),
+                lastDescent = if (d == null) "" else fmt("%.2f s, peak %.2f m/s, %.2f m", d.durationUs / 1e6, d.peakSpeed, d.travelM),
                 cuesSpoken = engine.cuesSpoken, cuesSuppressed = engine.cuesSuppressed,
                 latencyP50Ms = latency.percentile(50.0).toFloat(), latencyP95Ms = latency.percentile(95.0).toFloat(),
                 cueClipsReady = cuePlayer.clipsReady,

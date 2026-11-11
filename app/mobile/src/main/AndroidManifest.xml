@@ -10,6 +10,9 @@
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Pod-emulator mode only: advertise as a pod and read this phone's IMU faster than 200 Hz. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
     <!--
         Requirement R8: nothing leaves the device. The MediaPipe library pulls in Google's telemetry
