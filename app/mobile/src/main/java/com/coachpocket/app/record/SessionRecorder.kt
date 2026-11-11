@@ -12,6 +12,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Records a set to app-private storage in the session format defined in `:core`
@@ -35,39 +36,58 @@ class SessionRecorder(private val context: Context) {
         val name = "${stamp}_${safeSubject}_${meta.values["condition"] ?: "clean"}"
         val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "sessions/$name")
         if (!dir.mkdirs()) return null
-        io.execute { guarded { writer = SessionWriter(dir).also { it.open(meta) } } }
+        submit { writer = SessionWriter(dir).also { it.open(meta) } }
         directory = dir
         return dir
     }
 
     fun stop() {
         directory = null
-        io.execute {
-            guarded { writer?.close() }
-            writer = null
+        submit {
+            try {
+                writer?.close()
+            } finally {
+                writer = null
+            }
         }
+    }
+
+    /** Finishes any open session and ends the writer thread. The recorder cannot be used afterwards. */
+    fun close() {
+        stop()
+        io.shutdown()
     }
 
     fun imu(podSamples: List<ImuSample>, phoneSamples: List<ImuSample>, rxUs: Long) {
         if (!isRecording) return
-        io.execute { guarded { writer?.imu(podSamples, phoneSamples, rxUs) } }
+        submit { writer?.imu(podSamples, phoneSamples, rxUs) }
     }
 
     fun pose(frame: PoseFrame, rxUs: Long) {
         if (!isRecording) return
-        io.execute { guarded { writer?.pose(frame, rxUs) } }
+        submit { writer?.pose(frame, rxUs) }
     }
 
     fun event(tUs: Long, type: String, detail: String) {
         if (!isRecording) return
-        io.execute { guarded { writer?.event(tUs, type, detail) } }
+        submit { writer?.event(tUs, type, detail) }
     }
 
-    private inline fun guarded(block: () -> Unit) {
+    private fun submit(block: () -> Unit) {
         try {
-            block()
-        } catch (e: IOException) {
-            Log.e("SessionRecorder", "write failed", e)
+            io.execute {
+                try {
+                    block()
+                } catch (e: IOException) {
+                    Log.e(TAG, "write failed", e)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            // A camera or Bluetooth callback that was already in flight when the recorder closed.
         }
+    }
+
+    private companion object {
+        const val TAG = "SessionRecorder"
     }
 }

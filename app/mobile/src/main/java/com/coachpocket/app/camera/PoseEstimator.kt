@@ -48,9 +48,17 @@ class PoseEstimator(
     private var lastTimestampMs = 0L
     private var failed = false
 
+    // Set when the GPU delegate was created but then failed while running.
+    @Volatile
+    private var gpuBroken = false
+
+    @Volatile
+    private var recreate = false
+
     override fun analyze(image: ImageProxy) {
         try {
-            if (loadedModel != model) {
+            if (loadedModel != model || recreate) {
+                recreate = false
                 release()
                 failed = false
             }
@@ -83,7 +91,7 @@ class PoseEstimator(
 
     private fun create(): PoseLandmarker? {
         val wanted = model
-        for (delegate in listOf(Delegate.GPU, Delegate.CPU)) {
+        for (delegate in if (gpuBroken) listOf(Delegate.CPU) else listOf(Delegate.GPU, Delegate.CPU)) {
             try {
                 val options = PoseLandmarker.PoseLandmarkerOptions.builder()
                     .setBaseOptions(BaseOptions.builder().setModelAssetPath(wanted.asset).setDelegate(delegate).build())
@@ -93,7 +101,16 @@ class PoseEstimator(
                     .setMinPosePresenceConfidence(0.5f)
                     .setMinTrackingConfidence(0.5f)
                     .setResultListener { result, _ -> onResult(result) }
-                    .setErrorListener { e -> onStatus("-", e.message) }
+                    .setErrorListener { e ->
+                        Log.w(TAG, "pose landmarker error on $delegate", e)
+                        if (delegate == Delegate.GPU) {
+                            // Rebuild on the CPU at the next frame rather than staying dead.
+                            gpuBroken = true
+                            recreate = true
+                        } else {
+                            onStatus("-", e.message)
+                        }
+                    }
                     .build()
                 landmarker = PoseLandmarker.createFromOptions(context, options)
                 loadedModel = wanted

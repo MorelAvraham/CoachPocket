@@ -30,7 +30,8 @@ class CuePlayer(context: Context) : TextToSpeech.OnInitListener {
         .build()
     private val soundPool = SoundPool.Builder().setMaxStreams(1).setAudioAttributes(attributes).build()
     private val clips = ConcurrentHashMap<FaultType, Int>()
-    private val loading = ConcurrentHashMap<Int, FaultType>()
+    private val loading = HashMap<Int, FaultType>() // guarded by itself
+    private val retries = ConcurrentHashMap<FaultType, Int>()
     private val tts = TextToSpeech(appContext, this)
 
     @Volatile
@@ -42,7 +43,8 @@ class CuePlayer(context: Context) : TextToSpeech.OnInitListener {
 
     init {
         soundPool.setOnLoadCompleteListener { _, soundId, status ->
-            val fault = loading.remove(soundId)
+            // Same lock as the load call, so the id is always registered before it is looked up.
+            val fault = synchronized(loading) { loading.remove(soundId) }
             if (status == 0 && fault != null) clips[fault] = soundId
         }
     }
@@ -58,20 +60,34 @@ class CuePlayer(context: Context) : TextToSpeech.OnInitListener {
             override fun onStart(utteranceId: String) {}
 
             override fun onDone(utteranceId: String) {
-                if (!utteranceId.startsWith(CLIP_PREFIX)) return
-                val fault = FaultType.valueOf(utteranceId.removePrefix(CLIP_PREFIX))
-                loading[soundPool.load(clipFile(fault).path, 1)] = fault
+                val fault = clipFault(utteranceId) ?: return
+                synchronized(loading) { loading[soundPool.load(clipFile(fault).path, 1)] = fault }
             }
 
             @Suppress("OVERRIDE_DEPRECATION")
             override fun onError(utteranceId: String) {
                 Log.w(TAG, "could not synthesise $utteranceId")
+                retry(utteranceId)
             }
+
+            // The synthesis request was flushed from the queue before it ran.
+            override fun onStop(utteranceId: String, interrupted: Boolean) = retry(utteranceId)
         })
         ttsReady = true
-        for (fault in FaultType.entries) {
-            tts.synthesizeToFile(fault.cueText, null, clipFile(fault), CLIP_PREFIX + fault.name)
-        }
+        for (fault in FaultType.entries) synthesise(fault)
+    }
+
+    private fun synthesise(fault: FaultType) {
+        tts.synthesizeToFile(fault.cueText, null, clipFile(fault), CLIP_PREFIX + fault.name)
+    }
+
+    private fun clipFault(utteranceId: String): FaultType? =
+        if (utteranceId.startsWith(CLIP_PREFIX)) FaultType.valueOf(utteranceId.removePrefix(CLIP_PREFIX)) else null
+
+    /** A clip that failed stays on slow live speech for good unless it is tried again; allow a few attempts. */
+    private fun retry(utteranceId: String) {
+        val fault = clipFault(utteranceId) ?: return
+        if (retries.merge(fault, 1, Int::plus)!! <= MAX_RETRIES) synthesise(fault)
     }
 
     /** Starts the cue and returns the time (phone clock, microseconds) at which playback was requested. */
@@ -81,7 +97,8 @@ class CuePlayer(context: Context) : TextToSpeech.OnInitListener {
             if (cue.interrupt && currentStream != 0) soundPool.stop(currentStream)
             currentStream = soundPool.play(clip, 1f, 1f, 1, 0, 1f)
         } else if (ttsReady) {
-            tts.speak(cue.text, TextToSpeech.QUEUE_FLUSH, null, "live")
+            // QUEUE_FLUSH would also throw away clips still waiting to be synthesised.
+            tts.speak(cue.text, if (clipsReady) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "live")
         }
         return nowUs()
     }
@@ -96,5 +113,6 @@ class CuePlayer(context: Context) : TextToSpeech.OnInitListener {
     private companion object {
         const val TAG = "CuePlayer"
         const val CLIP_PREFIX = "clip:"
+        const val MAX_RETRIES = 3
     }
 }

@@ -47,7 +47,9 @@ fun CameraPreview(viewModel: CoachViewModel, frontCamera: Boolean, modifier: Mod
     DisposableEffect(frontCamera, lifecycleOwner) {
         val future = ProcessCameraProvider.getInstance(context)
         var provider: ProcessCameraProvider? = null
+        var disposed = false
         future.addListener({
+            if (disposed) return@addListener // left this screen before the camera service answered
             try {
                 val cameraProvider = future.get().also { provider = it }
                 val fourByThree = ResolutionSelector.Builder()
@@ -63,13 +65,24 @@ fun CameraPreview(viewModel: CoachViewModel, frontCamera: Boolean, modifier: Mod
                     )
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                // Pin 30 fps: by default auto-exposure halves the frame rate in a dim gym.
-                Camera2Interop.Extender(analysisBuilder)
-                    .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
+                val selector = if (frontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                // Pin 30 fps where the camera offers it: by default auto-exposure halves the frame
+                // rate in a dim gym. The range must be one the camera lists, or the HAL may reject it.
+                val fixed30 = Range(30, 30)
+                val supportsFixed30 = cameraProvider.availableCameraInfos
+                    .filter { selector.filter(listOf(it)).isNotEmpty() }
+                    .any { info ->
+                        Camera2CameraInfo.from(info)
+                            .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                            ?.contains(fixed30) == true
+                    }
+                if (supportsFixed30) {
+                    Camera2Interop.Extender(analysisBuilder)
+                        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fixed30)
+                }
                 val analysis = analysisBuilder.build()
                 analysis.setAnalyzer(viewModel.analysisExecutor, viewModel.poseEstimator)
 
-                val selector = if (frontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
                 cameraProvider.unbindAll()
                 val camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
 
@@ -82,7 +95,10 @@ fun CameraPreview(viewModel: CoachViewModel, frontCamera: Boolean, modifier: Mod
             }
         }, ContextCompat.getMainExecutor(context))
 
-        onDispose { provider?.unbindAll() }
+        onDispose {
+            disposed = true
+            provider?.unbindAll()
+        }
     }
 
     AndroidView(factory = { previewView }, modifier = modifier)

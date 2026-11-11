@@ -80,6 +80,9 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
     private var sent = 0L
     private var dropped = 0L
     private var lastStatsMs = 0L
+
+    // Added to sensor timestamps to put them on the elapsedRealtime clock the time beacon uses.
+    private var sensorClockOffsetUs = Long.MIN_VALUE
     private var message: String? = null
 
     val isRunning: Boolean get() = server != null
@@ -121,7 +124,7 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
         val thread = HandlerThread("pod-emulator").also { it.start() }
         sensorThread = thread
         val handler = Handler(thread.looper)
-        count = 0; seq = 0; sent = 0; dropped = 0; lastSampleUs = 0
+        count = 0; seq = 0; sent = 0; dropped = 0; lastSampleUs = 0; sensorClockOffsetUs = Long.MIN_VALUE
         periodUs = accel!!.minDelay.coerceAtLeast(1000).toDouble()
         sensors?.registerListener(this, accel, SensorManager.SENSOR_DELAY_FASTEST, handler)
         sensors?.registerListener(this, gyroSensor, SensorManager.SENSOR_DELAY_FASTEST, handler)
@@ -134,6 +137,9 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
         sensors?.unregisterListener(this)
         sensorThread?.quitSafely(); sensorThread = null
         bluetooth?.adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+        // Closing the server does not reliably drop the link; without this the coach phone can sit
+        // on a dead connection that still looks alive.
+        synchronized(lock) { central }?.let { server?.cancelConnection(it) }
         server?.close(); server = null
         synchronized(lock) {
             queue.clear(); inFlight = false; central = null; dataSubscribed = false; syncSubscribed = false
@@ -155,7 +161,13 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
             return
         }
         // One pod sample per accelerometer event, paired with the latest gyroscope reading.
-        val tUs = event.timestamp / 1000
+        if (sensorClockOffsetUs == Long.MIN_VALUE) {
+            // Sensor timestamps should already be on the elapsedRealtime clock, but some phones use a
+            // base that excludes sleep. A difference beyond delivery latency is such a base: correct it.
+            val diffUs = (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1000
+            sensorClockOffsetUs = if (diffUs > 200_000 || diffUs < -200_000) diffUs else 0
+        }
+        val tUs = event.timestamp / 1000 + sensorClockOffsetUs
         if (lastSampleUs != 0L) {
             val dt = (tUs - lastSampleUs).toDouble()
             if (dt > 0 && dt < 100_000) periodUs += 0.01 * (dt - periodUs)
@@ -222,11 +234,10 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            // Connection events arrive for every LE link on this phone (a watch, earbuds), so the
+            // stream's destination is not taken from here: it is the device that subscribes.
             synchronized(lock) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    central = device
-                    message = "Connected"
-                } else if (central?.address == device.address) {
+                if (newState != BluetoothProfile.STATE_CONNECTED && central?.address == device.address) {
                     central = null; dataSubscribed = false; syncSubscribed = false
                     queue.clear(); inFlight = false
                     maxSamples = PodProtocol.MAX_SAMPLES_PER_PACKET
@@ -236,6 +247,8 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
         }
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            // The coach phone negotiates the MTU before it subscribes, so this cannot be filtered by
+            // device; another device's smaller MTU only makes packets shorter, never invalid.
             synchronized(lock) {
                 maxSamples = ((mtu - 3 - PodProtocol.HEADER_BYTES) / PodProtocol.SAMPLE_BYTES).coerceIn(1, PodProtocol.MAX_SAMPLES_PER_PACKET)
             }
@@ -248,14 +261,27 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
             if (descriptor.uuid == CCCD) {
                 val enabled = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                 synchronized(lock) {
-                    if (descriptor.characteristic.uuid == IMU_DATA) dataSubscribed = enabled else syncSubscribed = enabled
+                    if (descriptor.characteristic.uuid == IMU_DATA) {
+                        if (enabled && central?.address != device.address) {
+                            // A new coach phone takes over the stream.
+                            central = device
+                            syncSubscribed = false
+                            queue.clear(); inFlight = false
+                            message = "Coach phone connected"
+                        }
+                        if (central?.address == device.address) dataSubscribed = enabled
+                    } else if (central?.address == device.address) {
+                        syncSubscribed = enabled
+                    }
                 }
             }
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
         }
 
         override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor) {
-            val subscribed = synchronized(lock) { if (descriptor.characteristic.uuid == IMU_DATA) dataSubscribed else syncSubscribed }
+            val subscribed = synchronized(lock) {
+                central?.address == device.address && if (descriptor.characteristic.uuid == IMU_DATA) dataSubscribed else syncSubscribed
+            }
             val value = if (subscribed) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
             server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
         }
@@ -265,7 +291,7 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
             val t2 = podClockUs()
-            if (characteristic.uuid == SYNC && value.size == 8) {
+            if (characteristic.uuid == SYNC && value.size == 8 && synchronized(lock) { central?.address == device.address }) {
                 var t1 = 0L
                 for (i in 0 until 8) t1 = t1 or ((value[i].toLong() and 0xFF) shl (8 * i))
                 enqueue(characteristic, PodPacketCodec.encodeSyncResponse(t1, t2, podClockUs()), isData = false)
@@ -274,7 +300,7 @@ class PodEmulator(private val context: Context, private val onStats: (EmulatorSt
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            synchronized(lock) { inFlight = false }
+            synchronized(lock) { if (central?.address == device.address) inFlight = false }
             pump()
         }
     }

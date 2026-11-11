@@ -56,6 +56,7 @@ data class UiState(
     val sampleRateHz: Float = 0f,
     val packetsReceived: Long = 0,
     val packetsLost: Long = 0,
+    val packetsMalformed: Long = 0,
     val lossPercent: Float = 0f,
     val syncLocked: Boolean = false,
     val skewPpm: Float = 0f,
@@ -176,10 +177,9 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
                 rateWindowStartUs = rxUs; rateWindowSamples = 0
             }
         }
-        if (events.isNotEmpty()) {
-            handle(events)
-            pushUi(force = true)
-        }
+        if (events.isNotEmpty()) handle(events)
+        // Also refresh from here: with no camera or no pose model, nothing else updates the pod figures.
+        pushUi(force = events.isNotEmpty())
     }
 
     override fun onSyncResponse(bytes: ByteArray, rxNs: Long) {
@@ -330,6 +330,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
                 valgus = r?.valgusDeviation ?: Float.NaN, frontalView = r?.frontalView ?: false,
                 sampleRateHz = sampleRateHz,
                 packetsReceived = decoder.packetsReceived, packetsLost = decoder.packetsLost,
+                packetsMalformed = decoder.packetsMalformed,
                 lossPercent = (decoder.lossRatio * 100).toFloat(),
                 syncLocked = sync.isLocked, skewPpm = sync.skewPpm.toFloat(), transportBiasMs = sync.transportBiasUs / 1000f,
                 imuVelocity = engine.imuVelocity,
@@ -344,7 +345,7 @@ class CoachViewModel(app: Application) : AndroidViewModel(app), PodBleClient.Lis
     override fun onCleared() {
         stopSimulation()
         ble.disconnect()
-        recorder.stop()
+        recorder.close()
         cuePlayer.release()
         analysisExecutor.execute { poseEstimator.release() }
         analysisExecutor.shutdown()

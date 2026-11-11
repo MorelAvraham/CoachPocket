@@ -167,6 +167,9 @@ private fun Hud(ui: UiState) {
                 ),
                 if (ui.lossPercent < 1f) Good else Warn,
             )
+            if (ui.packetsMalformed > 0) {
+                Mono("      ${ui.packetsMalformed} unreadable packets: wrong format, or cut short by a small MTU", Bad)
+            }
             Mono(
                 fmt("SYNC  %s  skew %+.0f ppm  bias %.1f ms", if (ui.syncLocked) "locked" else "acquiring", ui.skewPpm, ui.transportBiasMs),
                 if (ui.syncLocked) Good else Warn,

@@ -59,4 +59,14 @@ class ClockSyncTest {
         sync.addOneWay(100, 9_000_000_000L) // pod clock jumped back to zero
         assertEquals(9_000_000_000L - 100 + 5_000, sync.podToPhoneUs(5_000))
     }
+
+    @Test
+    fun resetForgetsTheTransportBiasOfThePreviousLink() {
+        val sync = ClockSync()
+        val pod = feed(sync)
+        sync.addTwoWay(phoneOf(pod) - 5_000, pod, pod + 300, phoneOf(pod + 300) + 5_000)
+        assertTrue(sync.transportBiasUs > 0)
+        sync.reset()
+        assertEquals(0L, sync.transportBiasUs)
+    }
 }

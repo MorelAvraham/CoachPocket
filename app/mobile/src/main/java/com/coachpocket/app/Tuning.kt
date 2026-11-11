@@ -1,6 +1,7 @@
 package com.coachpocket.app
 
 import android.content.Context
+import androidx.core.content.edit
 import com.coachpocket.core.cue.CueConfig
 import com.coachpocket.core.engine.ChannelMode
 import com.coachpocket.core.engine.EngineConfig
@@ -53,14 +54,14 @@ class TuningStore(context: Context) {
     }
 
     fun save(t: Tuning) {
-        prefs.edit()
-            .putFloat("valgus", t.valgusThreshold).putFloat("min_eccentric", t.minEccentricS)
-            .putFloat("max_speed", t.maxDescentSpeed).putFloat("cooldown", t.cueCooldownS)
-            .putInt("mode", t.mode.ordinal)
-            .apply()
+        prefs.edit {
+            putFloat("valgus", t.valgusThreshold).putFloat("min_eccentric", t.minEccentricS)
+            putFloat("max_speed", t.maxDescentSpeed).putFloat("cooldown", t.cueCooldownS)
+            putInt("mode", t.mode.ordinal)
+        }
     }
 
     var lastSubject: String
         get() = prefs.getString("subject", "") ?: ""
-        set(value) = prefs.edit().putString("subject", value).apply()
+        set(value) = prefs.edit { putString("subject", value) }
 }
