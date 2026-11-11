@@ -1,0 +1,101 @@
+# CoachPocket app (edge device)
+
+Android app that runs the whole pipeline on the phone: camera, pose estimation, BLE receive,
+clock alignment, squat analysis and the voice cue. First slice: the demo-day MVP path, **squat
+end to end** (knee valgus by camera, too-fast descent by pod, cue in the same repetition).
+
+## Toolchain (pinned)
+
+| Tool | Version |
+|---|---|
+| JDK | 17 or newer (built and tested with 21) |
+| Gradle | 8.14.3 (wrapper) |
+| Android Gradle Plugin | 8.13.2 |
+| Kotlin | 2.2.21 |
+| compileSdk / targetSdk / minSdk | 36 / 36 / 31 (Android 12) |
+| MediaPipe Tasks Vision | 0.10.29 |
+| CameraX | 1.5.3 |
+
+All library versions live in `gradle/libs.versions.toml`.
+
+## Build and run
+
+```bash
+cd app
+./gradlew :core:test            # logic tests, no Android SDK or phone needed
+./gradlew :mobile:assembleDebug # APK in mobile/build/outputs/apk/debug/
+./gradlew :mobile:installDebug  # onto a phone with USB debugging enabled
+```
+
+Or open the `app/` folder in Android Studio. The first build downloads the two pose models
+(lite 5.5 MB, full 9 MB) into `mobile/src/main/assets/`; they are not committed.
+
+## Modules
+
+```
+app/
+├── core/     Pure Kotlin, no Android. All the logic, unit-tested on the JVM.
+│   ├── protocol/  BLE packet format, decoder, loss counters (R1)
+│   ├── sync/      pod-to-phone clock alignment (R2)
+│   ├── pose/      keypoint types and geometry
+│   ├── squat/     rep segmentation and knee-valgus detection from keypoints
+│   ├── imu/       vertical-velocity tracking and descent tempo from the pod
+│   ├── cue/       cue arbitration: cooldown, priority, one at a time (R7)
+│   ├── engine/    CoachEngine: glues the channels together, emits events
+│   └── sim/       SimulatedPod: generates the firmware's exact packets
+└── mobile/   Android app: thin shell around core.
+    ├── camera/    CameraX + MediaPipe Pose Landmarker (GPU, CPU fallback)
+    ├── ble/       GATT client for the pod
+    ├── audio/     pre-synthesised cue clips on a SoundPool
+    ├── record/    session recorder (keypoints + IMU + events as CSV)
+    └── ui/        one Compose screen: preview, skeleton, live metrics
+```
+
+The split matters: `core` has no Android dependency, so a recorded session can be replayed through
+exactly the code that runs on the phone, from a laptop. That is how the camera-only vs pod-only vs
+fused comparison (R5) will be run.
+
+## Using it
+
+1. Tripod 2 to 3 m away, phone upright, whole body in frame. **In front of the lifter** for knee
+   valgus; from the side the app still counts reps and says so on screen.
+2. Stand tall for a moment (calibrates standing hip height), then lift.
+3. `Connect pod` scans for the CoachPocket BLE service. Without a pod the app runs camera-only and
+   measures descent tempo from the camera instead.
+4. `Record` writes `imu.csv`, `pose.csv` and `events.csv` under
+   `Android/data/com.coachpocket.app/files/sessions/<timestamp>/`. Keypoints only, never video.
+5. `Sim pod` feeds synthetic pod packets (two controlled squats, then one dive-bomb, repeating) to
+   bench-test the receive path. It is not linked to what the camera sees.
+
+The top panel is the measurement harness: pose fps and inference time (R3), pod sample rate and
+packet loss (R1), sync state, and cue latency from fault onset to the audio play call.
+
+## How the detection works today
+
+| Fault | Channel | Rule |
+|---|---|---|
+| Knee valgus | Camera | Knee sits more than 8% of leg length inside the hip-ankle line for 3 consecutive frames, while in the rep. Frontal view only. |
+| Too-fast descent | Pod | Downward speed above 0.8 m/s (caught mid-descent), or eccentric phase under 1.0 s. Only cued if the camera confirms a rep is in progress. |
+| Too-fast descent (no pod) | Camera | Eccentric phase under 1.0 s, known at the bottom. |
+
+Fusion is rule-based for now and runs both ways: the camera tells the IMU integrator when the
+lifter is moving (stops false zero-velocity resets in a slow descent), and vetoes pod faults that
+happen outside a rep (walking the bar out, re-racking).
+
+## Known limits: read before trusting a number
+
+- **Not yet run on a phone.** The logic is covered by 26 JVM tests and the APK builds and passes
+  lint, but camera, GPU inference, BLE and audio have not been exercised on hardware. Expect
+  first-run fixes.
+- **Every threshold is a placeholder** (`SquatConfig`, `TempoConfig`). They are reasoned defaults,
+  not fitted values. They get fitted on the labelled data (U4, M2/M3) and reviewed with the trainer.
+- **The latency shown is a lower bound.** It ends at the `play()` call. Speaker output adds tens of
+  milliseconds, Bluetooth earphones add 100 to 250 ms. R6 can only be signed off with the 240 fps
+  video test (U6).
+- **Pose model is float16 on the GPU, not INT8 on the NPU.** MediaPipe's published bundles are
+  float. INT8 and the Hexagon NPU are M3/M5 work and will need a different runtime (LiteRT + QNN).
+- **The pod protocol is defined here and the firmware does not exist yet.** See
+  `docs/pod-ble-protocol.md`; it needs BK's review before it is frozen.
+- **Clock sync without the time beacon is late by the minimum BLE delay** (several ms). The
+  beacon or the tap test (U2) removes it.
+- The app has no `INTERNET` permission; it is stripped from the merged manifest on purpose (R8).
