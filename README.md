@@ -97,7 +97,9 @@ CoachPocket/
 └── README.md
 ```
 
-Folders are added as each component lands. Every component folder gets its own README with exact toolchain versions and build steps.
+`app/` is in: see [app/README.md](app/README.md) for the build steps, and [docs/pod-ble-protocol.md](docs/pod-ble-protocol.md) for the pod-to-phone packet format (draft, awaiting firmware review).
+
+The remaining folders are added as each component lands. Every component folder gets its own README with exact toolchain versions and build steps.
 
 ## Getting started
 
